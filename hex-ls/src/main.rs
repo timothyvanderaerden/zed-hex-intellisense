@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, MarkupContent, MarkupKind,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    CompletionTextEdit, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    MarkupContent, MarkupKind, Position, Range, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit,
 };
 use regex::Regex;
 use serde_json::Value;
@@ -456,7 +457,22 @@ fn compute_completions(state: &mut ServerState, params: &CompletionParams) -> Ve
     match detect_context(text_before) {
         Some(CompletionContext::PackageName(partial)) => complete_package_names(state, &partial),
         Some(CompletionContext::Version(pkg, partial_ver)) => {
-            complete_versions(state, &pkg, &partial_ver)
+            // Find where the partial version text starts in the line so we can
+            // build a text_edit that replaces the whole partial (not just the
+            // current word-boundary token that Zed would otherwise guess).
+            let ver_start = version_re()
+                .captures(text_before)
+                .and_then(|c| c.get(2))
+                .map(|m| m.start() as u32)
+                .unwrap_or(safe_end as u32);
+            complete_versions(
+                state,
+                &pkg,
+                &partial_ver,
+                line_idx as u32,
+                ver_start,
+                safe_end as u32,
+            )
         }
         None => vec![],
     }
@@ -520,7 +536,10 @@ fn complete_package_names(state: &mut ServerState, partial: &str) -> Vec<Complet
 fn complete_versions(
     state: &mut ServerState,
     pkg_name: &str,
-    _partial: &str,
+    partial: &str,
+    line: u32,
+    ver_start: u32,
+    cursor: u32,
 ) -> Vec<CompletionItem> {
     let url = format!("{HEX_API_BASE}/packages/{pkg_name}");
 
@@ -534,13 +553,6 @@ fn complete_versions(
         None => return vec![],
     };
 
-    // The `configs["mix.exs"]` field contains the canonical dependency
-    // snippet which makes a useful detail line.
-    let mix_config = data["configs"]["mix.exs"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
     // Collect version strings.  The API returns them newest-first already.
     let versions: Vec<String> = releases
         .iter()
@@ -549,67 +561,157 @@ fn complete_versions(
         .collect();
 
     // -----------------------------------------------------------------------
-    // Deduplication for ~> X.Y suggestions
+    // Detect any operator prefix the user has already typed.
     //
-    // Because the API returns newest-first, the first time we encounter a
-    // "X.Y" key it corresponds to the latest patch release for that minor.
-    // We record that mapping so we can emit exactly one `~> X.Y` per minor.
+    // When an operator is present, we:
+    //   • Only emit items that match that operator (suppress others).
+    //   • Set `filter_text` to the bare version digits so that Zed’s
+    //     word-boundary filter (which splits on the space inside
+    //     “~> 1.” and sees only “1.”) still matches the item.
+    //   • Keep the operator in the text_edit new_text so selecting the
+    //     item never strips it off.
+    // -----------------------------------------------------------------------
+    let (op, ver_filter): (&str, &str) = if let Some(r) = partial.strip_prefix("~> ") {
+        ("~> ", r)
+    } else if let Some(r) = partial.strip_prefix("~>") {
+        // "~>" typed without the space yet – still a tilde-constraint context.
+        ("~> ", r)
+    } else if let Some(r) = partial.strip_prefix(">= ") {
+        (">= ", r)
+    } else if partial.starts_with(">=") || partial.starts_with(">") {
+        // ">=" without space, bare ">", or ">=X.Y.Z" – all >= context.
+        let r = partial.trim_start_matches(|c: char| !c.is_ascii_digit());
+        (">= ", r)
+    } else if partial.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        // User is typing a raw version number directly → only offer exact
+        // versions; suppress ~> and >= items so they don't bubble to the top
+        // via fuzzy-matching when the partial matches digits inside them.
+        ("digit", partial)
+    } else {
+        // No operator: show all three item flavours.
+        ("", partial)
+    };
+
+    // -----------------------------------------------------------------------
+    // Deduplication for ~> X.Y suggestions
     // -----------------------------------------------------------------------
     let mut latest_patch_for_minor: HashMap<String, String> = HashMap::new();
     for ver in &versions {
-        if let Some(minor_key) = minor_key(ver) {
-            // `entry(...).or_insert(...)` keeps the *first* (i.e. latest) value.
+        if let Some(mk) = minor_key(ver) {
             latest_patch_for_minor
-                .entry(minor_key)
+                .entry(mk)
                 .or_insert_with(|| ver.clone());
         }
     }
 
+    // Build a text_edit that replaces the *entire* partial version text
+    // (from ver_start to cursor), regardless of Zed’s word-boundary guess.
+    let make_edit = |new_text: &str| {
+        CompletionTextEdit::Edit(TextEdit {
+            range: Range {
+                start: Position {
+                    line,
+                    character: ver_start,
+                },
+                end: Position {
+                    line,
+                    character: cursor,
+                },
+            },
+            new_text: new_text.to_string(),
+        })
+    };
+
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut tilde_emitted: HashMap<String, ()> = HashMap::new();
+    let mut first_item = true; // used to preselect the top suggestion
 
     for ver in &versions {
         // ── ~> X.Y ──────────────────────────────────────────────────────
-        // Emit at most once per X.Y, and only when `ver` is the latest
-        // patch for that minor (so the suggestion always describes the
-        // best-matching constraint).
-        if let Some(mk) = minor_key(ver) {
-            let is_latest = latest_patch_for_minor.get(&mk).map(|s| s.as_str()) == Some(ver);
-            if is_latest && !tilde_emitted.contains_key(&mk) {
-                tilde_emitted.insert(mk.clone(), ());
-                let label = format!("~> {mk}");
+        // Only when the user typed "~> " explicitly or nothing at all.
+        if op == "~> " || op.is_empty() {
+            if let Some(mk) = minor_key(ver) {
+                let is_latest = latest_patch_for_minor.get(&mk).map(|s| s.as_str()) == Some(ver);
+                // Server-side pre-filter: mk must start with whatever digits
+                // the user typed after the operator (e.g. "1." in "~> 1.").
+                if is_latest && mk.starts_with(ver_filter) && !tilde_emitted.contains_key(&mk) {
+                    tilde_emitted.insert(mk.clone(), ());
+                    let label = format!("~> {mk}");
+                    let preselect = first_item;
+                    first_item = false;
+                    items.push(CompletionItem {
+                        label: label.clone(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some(format!("Semver-compatible with {mk}.x")),
+                        sort_text: Some(format!("0{label}")),
+                        preselect: Some(preselect),
+                        // Zed computes its filter input from the text_edit range
+                        // content.  Two regimes:
+                        //  • ver_filter empty  → only operator typed ("~> ").
+                        //    Use the full label ("~> 1.7") so it passes a
+                        //    filter like "~>" or "~> ".
+                        //  • ver_filter present → digits follow the operator
+                        //    ("~> 1.").  Zed's word-boundary splits on the
+                        //    space, so the filter word is "1.".  Use just the
+                        //    version digits ("1.7") so it matches.
+                        filter_text: if op.is_empty() {
+                            None
+                        } else if ver_filter.is_empty() {
+                            Some(label.clone())
+                        } else {
+                            Some(mk.clone())
+                        },
+                        text_edit: Some(make_edit(&label)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // ── >= X.Y.Z ────────────────────────────────────────────────────
+        // Only when the user typed ">= " explicitly or nothing at all.
+        if op == ">= " || op.is_empty() {
+            if ver.starts_with(ver_filter) {
+                let label = format!(">= {ver}");
+                let preselect = first_item && op == ">= ";
+                if preselect {
+                    first_item = false;
+                }
                 items.push(CompletionItem {
                     label: label.clone(),
                     kind: Some(CompletionItemKind::VALUE),
-                    detail: Some(format!("Semver-compatible with {mk}.x")),
-                    insert_text: Some(label),
+                    detail: Some(format!("Minimum version {ver}")),
+                    sort_text: Some(format!("1{label}")),
+                    preselect: Some(preselect),
+                    // Same two-regime filter_text logic as ~> items above.
+                    filter_text: if op.is_empty() {
+                        None
+                    } else if ver_filter.is_empty() {
+                        Some(label.clone())
+                    } else {
+                        Some(ver.clone())
+                    },
+                    text_edit: Some(make_edit(&label)),
                     ..Default::default()
                 });
             }
         }
 
-        // ── >= X.Y.Z ────────────────────────────────────────────────────
-        let gte_label = format!(">= {ver}");
-        items.push(CompletionItem {
-            label: gte_label.clone(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some(format!("Minimum version {ver}")),
-            insert_text: Some(gte_label),
-            ..Default::default()
-        });
-
         // ── Exact version ───────────────────────────────────────────────
-        items.push(CompletionItem {
-            label: ver.clone(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: if mix_config.is_empty() {
-                None
-            } else {
-                Some(mix_config.clone())
-            },
-            insert_text: Some(ver.clone()),
-            ..Default::default()
-        });
+        // Emitted when no operator typed yet, or user is typing raw digits.
+        if op.is_empty() || op == "digit" {
+            items.push(CompletionItem {
+                label: ver.clone(),
+                kind: Some(CompletionItemKind::VALUE),
+                // Generate the dep snippet for *this specific* version.
+                // The API's `configs["mix.exs"]` always uses the latest
+                // version so it would show the wrong version number here.
+                detail: Some(format!("{{:{pkg_name}, \"{ver}\"}}")),
+                sort_text: Some(format!("2{ver}")),
+                text_edit: Some(make_edit(ver)),
+                ..Default::default()
+            });
+        }
     }
 
     items
@@ -982,5 +1084,70 @@ mod tests {
         assert_eq!(version_pkg_at_cursor(line, 10), None);
         // Cursor after the closing quote (byte 19, '}')
         assert_eq!(version_pkg_at_cursor(line, 19), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Operator detection (mirrors logic in complete_versions)
+    // -----------------------------------------------------------------------
+
+    fn parse_op(partial: &str) -> (&str, &str) {
+        if let Some(r) = partial.strip_prefix("~> ") {
+            ("~> ", r)
+        } else if let Some(r) = partial.strip_prefix("~>") {
+            ("~> ", r)
+        } else if let Some(r) = partial.strip_prefix(">= ") {
+            (">= ", r)
+        } else if partial.starts_with(">=") || partial.starts_with(">") {
+            let r = partial.trim_start_matches(|c: char| !c.is_ascii_digit());
+            (">= ", r)
+        } else if partial.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            ("digit", partial)
+        } else {
+            ("", partial)
+        }
+    }
+
+    #[test]
+    fn test_op_tilde_with_space() {
+        assert_eq!(parse_op("~> "), ("~> ", ""));
+        assert_eq!(parse_op("~> 1."), ("~> ", "1."));
+        assert_eq!(parse_op("~> 1.7"), ("~> ", "1.7"));
+    }
+
+    #[test]
+    fn test_op_tilde_without_space() {
+        assert_eq!(parse_op("~>"), ("~> ", ""));
+        assert_eq!(parse_op("~>1."), ("~> ", "1."));
+    }
+
+    #[test]
+    fn test_op_gte_with_space() {
+        assert_eq!(parse_op(">= "), (">= ", ""));
+        assert_eq!(parse_op(">= 1.7"), (">= ", "1.7"));
+        assert_eq!(parse_op(">= 1.7.14"), (">= ", "1.7.14"));
+    }
+
+    #[test]
+    fn test_op_gte_without_space() {
+        assert_eq!(parse_op(">="), (">= ", ""));
+    }
+
+    #[test]
+    fn test_op_bare_gt() {
+        assert_eq!(parse_op(">"), (">= ", ""));
+    }
+
+    #[test]
+    fn test_op_none() {
+        // Only a truly empty partial has no operator context.
+        assert_eq!(parse_op(""), ("", ""));
+    }
+
+    #[test]
+    fn test_op_digit() {
+        assert_eq!(parse_op("0"), ("digit", "0"));
+        assert_eq!(parse_op("0."), ("digit", "0."));
+        assert_eq!(parse_op("1.7"), ("digit", "1.7"));
+        assert_eq!(parse_op("1.7.1"), ("digit", "1.7.1"));
     }
 }
