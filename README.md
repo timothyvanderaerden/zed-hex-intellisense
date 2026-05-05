@@ -126,9 +126,11 @@ automatically when you reinstall the dev extension.
 1. Bump the version in `Cargo.toml` (root), `hex-ls/Cargo.toml`, `extension.toml`,
    and the `USER_AGENT` constant in `hex-ls/src/main.rs`.
 2. Update `CHANGELOG.md`.
-3. Push a bare semver tag (no `v` prefix): `git tag 0.4.0 && git push --tags`.
-4. The [Release workflow](.github/workflows/release.yml) builds `hex-ls` for
-   all platforms and uploads the archives to a GitHub Release automatically.
+3. Commit and push to `main`.
+4. Push a tag: `git tag v0.5.0 && git push --tags`.
+5. The [Release workflow](.github/workflows/release.yml) will automatically:
+   - Build `hex-ls` for all five platforms and attach archives to a GitHub Release.
+   - Rebuild `extension.wasm` from the tagged source and attach it to the same release.
 
 ## License
 

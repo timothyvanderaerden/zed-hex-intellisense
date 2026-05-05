@@ -113,31 +113,23 @@ impl HexIntelliSenseExtension {
             }
         }
 
-        // 3. Check GitHub for the latest release, download if needed.
+        // 3. Fetch the GitHub Release that matches this exact extension version.
+        //    Using github_release_by_tag_name (rather than latest_github_release)
+        //    guarantees the downloaded hex-ls binary is always the same version
+        //    as the WASM extension that is asking for it.
+        let version = env!("CARGO_PKG_VERSION"); // e.g. "0.5.0", set at compile time
+        let tag = format!("v{version}");
+
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        let release = zed::latest_github_release(
-            REPO,
-            zed::GithubReleaseOptions {
-                require_assets: true,
-                pre_release: false,
-            },
-        )?;
+        let release = zed::github_release_by_tag_name(REPO, &tag)
+            .map_err(|e| format!("No hex-ls release found for {tag}: {e}"))?;
 
         let (platform, arch) = zed::current_platform();
-        // Release tags are bare semver strings (e.g. "0.4.0"), not "v0.4.0".
-        // Strip a leading 'v' defensively so the extension works with either
-        // tag convention.
-        let version = release
-            .version
-            .strip_prefix('v')
-            .unwrap_or(&release.version)
-            .to_string();
-
-        let details = ReleaseDetails::new(platform, arch, &version);
+        let details = ReleaseDetails::new(platform, arch, version);
 
         let asset = release
             .assets
@@ -273,14 +265,5 @@ mod tests {
         assert_eq!(d.file_type, DownloadedFileType::Zip);
         assert_eq!(d.extract_dir, "hex-ls-0.4.0");
         assert_eq!(d.binary_path, "hex-ls-0.4.0/hex-ls.exe");
-    }
-
-    /// Strip the leading 'v' from a tag so both "0.4.0" and "v0.4.0" work.
-    #[test]
-    fn test_v_prefix_strip() {
-        let version_raw = "v0.4.0";
-        let version = version_raw.strip_prefix('v').unwrap_or(version_raw);
-        let d = ReleaseDetails::new(Os::Linux, Architecture::X8664, version);
-        assert_eq!(d.extract_dir, "hex-ls-0.4.0");
     }
 }

@@ -1,13 +1,13 @@
 name: Release
 
 # Triggered by a tag push that matches a bare semantic-version string,
-# e.g. `git tag 0.4.0 && git push --tags`.
+# e.g. `git tag v0.5.0 && git push --tags`.
 # The tag name becomes the GitHub Release version, which the WASM extension
 # reads at runtime via `latest_github_release` to pick the right binary.
 on:
   push:
     tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: write
@@ -88,10 +88,35 @@ jobs:
             hex-ls-*.tar.gz
             hex-ls-*.zip
 
+  # ── Build and commit the WASM extension ──────────────────────────────────
+  build-wasm:
+    name: Build extension WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + wasm32-wasip2
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build extension.wasm
+        run: |
+          cargo build -p hex-intellisense --target wasm32-wasip2 --release
+          cp target/wasm32-wasip2/release/hex_intellisense.wasm extension.wasm
+
+      - name: Upload extension.wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-wasm
+          path: extension.wasm
+
   # ── Gather artifacts and publish a GitHub Release ─────────────────────────
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-wasm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
