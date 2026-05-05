@@ -1,0 +1,11 @@
+id = "hex-intellisense"
+name = "Hex.pm IntelliSense"
+version = "0.1.0"
+schema_version = 1
+authors = ["Timothy Vanderaerden <timothyvanderaerden@gmail.com>"]
+description = "IntelliSense for hex.pm dependencies in Elixir mix.exs files. Provides package name and version autocompletion powered by the hex.pm API."
+repository = "https://github.com/timothyvanderaerden/hex-intellisense"
+
+[language_servers.hex-ls]
+name = "Hex.pm Language Server"
+languages = ["Elixir"]
