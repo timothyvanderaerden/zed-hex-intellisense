@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    CompletionTextEdit, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    MarkupContent, MarkupKind, Position, Range, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
+    CompletionResponse, CompletionTextEdit, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, MarkupContent, MarkupKind, Position, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
 };
 use regex::Regex;
 use serde_json::Value;
@@ -19,7 +19,7 @@ use serde_json::Value;
 
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 const HEX_API_BASE: &str = "https://hex.pm/api";
-const USER_AGENT: &str = "hex-ls/0.2.0";
+const USER_AGENT: &str = "hex-ls/0.4.0";
 
 // ---------------------------------------------------------------------------
 // Lazy-compiled regexes
@@ -294,7 +294,13 @@ fn handle_request(conn: &Connection, state: &mut ServerState, req: Request) {
             };
 
             let items = compute_completions(state, &params);
-            let result = CompletionResponse::Array(items);
+            // `is_incomplete: true` tells Zed the list may change and to
+            // retrigger completion on every edit — including deletions.
+            let result = CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items,
+                ..Default::default()
+            });
             conn.sender
                 .send(Message::Response(Response::new_ok(id, result)))
                 .ok();
@@ -561,38 +567,6 @@ fn complete_versions(
         .collect();
 
     // -----------------------------------------------------------------------
-    // Detect any operator prefix the user has already typed.
-    //
-    // When an operator is present, we:
-    //   • Only emit items that match that operator (suppress others).
-    //   • Set `filter_text` to the bare version digits so that Zed’s
-    //     word-boundary filter (which splits on the space inside
-    //     “~> 1.” and sees only “1.”) still matches the item.
-    //   • Keep the operator in the text_edit new_text so selecting the
-    //     item never strips it off.
-    // -----------------------------------------------------------------------
-    let (op, ver_filter): (&str, &str) = if let Some(r) = partial.strip_prefix("~> ") {
-        ("~> ", r)
-    } else if let Some(r) = partial.strip_prefix("~>") {
-        // "~>" typed without the space yet – still a tilde-constraint context.
-        ("~> ", r)
-    } else if let Some(r) = partial.strip_prefix(">= ") {
-        (">= ", r)
-    } else if partial.starts_with(">=") || partial.starts_with(">") {
-        // ">=" without space, bare ">", or ">=X.Y.Z" – all >= context.
-        let r = partial.trim_start_matches(|c: char| !c.is_ascii_digit());
-        (">= ", r)
-    } else if partial.chars().next().map_or(false, |c| c.is_ascii_digit()) {
-        // User is typing a raw version number directly → only offer exact
-        // versions; suppress ~> and >= items so they don't bubble to the top
-        // via fuzzy-matching when the partial matches digits inside them.
-        ("digit", partial)
-    } else {
-        // No operator: show all three item flavours.
-        ("", partial)
-    };
-
-    // -----------------------------------------------------------------------
     // Deduplication for ~> X.Y suggestions
     // -----------------------------------------------------------------------
     let mut latest_patch_for_minor: HashMap<String, String> = HashMap::new();
@@ -605,7 +579,15 @@ fn complete_versions(
     }
 
     // Build a text_edit that replaces the *entire* partial version text
-    // (from ver_start to cursor), regardless of Zed’s word-boundary guess.
+    // (from ver_start to cursor), regardless of Zed's word-boundary guess.
+    //
+    // When a text_edit is present, Zed uses the text from
+    // text_edit.range.start to the cursor as the filter input, then matches
+    // the item label against it.  Because ver_start points to the first
+    // character after the opening `"`, the filter input is always the full
+    // partial the user typed (e.g. `~> 1.` or `>= 2.` or `1.7`).  This
+    // means a plain label-prefix match (`label.starts_with(partial)`) is
+    // sufficient — no filter_text juggling needed.
     let make_edit = |new_text: &str| {
         CompletionTextEdit::Edit(TextEdit {
             range: Range {
@@ -628,15 +610,15 @@ fn complete_versions(
 
     for ver in &versions {
         // ── ~> X.Y ──────────────────────────────────────────────────────
-        // Only when the user typed "~> " explicitly or nothing at all.
-        if op == "~> " || op.is_empty() {
-            if let Some(mk) = minor_key(ver) {
-                let is_latest = latest_patch_for_minor.get(&mk).map(|s| s.as_str()) == Some(ver);
-                // Server-side pre-filter: mk must start with whatever digits
-                // the user typed after the operator (e.g. "1." in "~> 1.").
-                if is_latest && mk.starts_with(ver_filter) && !tilde_emitted.contains_key(&mk) {
-                    tilde_emitted.insert(mk.clone(), ());
-                    let label = format!("~> {mk}");
+        if let Some(mk) = minor_key(ver) {
+            let is_latest = latest_patch_for_minor.get(&mk).map(|s| s.as_str()) == Some(ver);
+            if is_latest && !tilde_emitted.contains_key(&mk) {
+                tilde_emitted.insert(mk.clone(), ());
+                let label = format!("~> {mk}");
+                // Server-side pre-filter: only send items whose label is
+                // prefixed by what the user has typed.  Zed will also filter
+                // client-side, but this keeps the response small.
+                if label.starts_with(partial) {
                     let preselect = first_item;
                     first_item = false;
                     items.push(CompletionItem {
@@ -645,22 +627,6 @@ fn complete_versions(
                         detail: Some(format!("Semver-compatible with {mk}.x")),
                         sort_text: Some(format!("0{label}")),
                         preselect: Some(preselect),
-                        // Zed computes its filter input from the text_edit range
-                        // content.  Two regimes:
-                        //  • ver_filter empty  → only operator typed ("~> ").
-                        //    Use the full label ("~> 1.7") so it passes a
-                        //    filter like "~>" or "~> ".
-                        //  • ver_filter present → digits follow the operator
-                        //    ("~> 1.").  Zed's word-boundary splits on the
-                        //    space, so the filter word is "1.".  Use just the
-                        //    version digits ("1.7") so it matches.
-                        filter_text: if op.is_empty() {
-                            None
-                        } else if ver_filter.is_empty() {
-                            Some(label.clone())
-                        } else {
-                            Some(mk.clone())
-                        },
                         text_edit: Some(make_edit(&label)),
                         ..Default::default()
                     });
@@ -669,28 +635,17 @@ fn complete_versions(
         }
 
         // ── >= X.Y.Z ────────────────────────────────────────────────────
-        // Only when the user typed ">= " explicitly or nothing at all.
-        if op == ">= " || op.is_empty() {
-            if ver.starts_with(ver_filter) {
-                let label = format!(">= {ver}");
-                let preselect = first_item && op == ">= ";
-                if preselect {
-                    first_item = false;
-                }
+        {
+            let label = format!(">= {ver}");
+            if label.starts_with(partial) {
+                let preselect = first_item;
+                first_item = false;
                 items.push(CompletionItem {
                     label: label.clone(),
                     kind: Some(CompletionItemKind::VALUE),
                     detail: Some(format!("Minimum version {ver}")),
                     sort_text: Some(format!("1{label}")),
                     preselect: Some(preselect),
-                    // Same two-regime filter_text logic as ~> items above.
-                    filter_text: if op.is_empty() {
-                        None
-                    } else if ver_filter.is_empty() {
-                        Some(label.clone())
-                    } else {
-                        Some(ver.clone())
-                    },
                     text_edit: Some(make_edit(&label)),
                     ..Default::default()
                 });
@@ -698,8 +653,9 @@ fn complete_versions(
         }
 
         // ── Exact version ───────────────────────────────────────────────
-        // Emitted when no operator typed yet, or user is typing raw digits.
-        if op.is_empty() || op == "digit" {
+        if ver.starts_with(partial) {
+            let preselect = first_item;
+            first_item = false;
             items.push(CompletionItem {
                 label: ver.clone(),
                 kind: Some(CompletionItemKind::VALUE),
@@ -708,6 +664,7 @@ fn complete_versions(
                 // version so it would show the wrong version number here.
                 detail: Some(format!("{{:{pkg_name}, \"{ver}\"}}")),
                 sort_text: Some(format!("2{ver}")),
+                preselect: Some(preselect),
                 text_edit: Some(make_edit(ver)),
                 ..Default::default()
             });
@@ -1087,67 +1044,41 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Operator detection (mirrors logic in complete_versions)
+    // Label prefix filtering (mirrors logic in complete_versions)
     // -----------------------------------------------------------------------
 
-    fn parse_op(partial: &str) -> (&str, &str) {
-        if let Some(r) = partial.strip_prefix("~> ") {
-            ("~> ", r)
-        } else if let Some(r) = partial.strip_prefix("~>") {
-            ("~> ", r)
-        } else if let Some(r) = partial.strip_prefix(">= ") {
-            (">= ", r)
-        } else if partial.starts_with(">=") || partial.starts_with(">") {
-            let r = partial.trim_start_matches(|c: char| !c.is_ascii_digit());
-            (">= ", r)
-        } else if partial.chars().next().map_or(false, |c| c.is_ascii_digit()) {
-            ("digit", partial)
-        } else {
-            ("", partial)
-        }
+    #[test]
+    fn test_label_prefix_filter_tilde() {
+        // ~> items are included when the partial is a prefix of the label.
+        let label = "~> 1.7";
+        assert!(label.starts_with(""));
+        assert!(label.starts_with("~>"));
+        assert!(label.starts_with("~> "));
+        assert!(label.starts_with("~> 1."));
+        assert!(label.starts_with("~> 1.7"));
+        // Non-matching partials are excluded.
+        assert!(!label.starts_with("1.7"));
+        assert!(!label.starts_with(">= "));
     }
 
     #[test]
-    fn test_op_tilde_with_space() {
-        assert_eq!(parse_op("~> "), ("~> ", ""));
-        assert_eq!(parse_op("~> 1."), ("~> ", "1."));
-        assert_eq!(parse_op("~> 1.7"), ("~> ", "1.7"));
+    fn test_label_prefix_filter_gte() {
+        let label = ">= 1.7.0";
+        assert!(label.starts_with(""));
+        assert!(label.starts_with(">="));
+        assert!(label.starts_with(">= "));
+        assert!(label.starts_with(">= 1.7"));
+        assert!(!label.starts_with("~> "));
+        assert!(!label.starts_with("1.7"));
     }
 
     #[test]
-    fn test_op_tilde_without_space() {
-        assert_eq!(parse_op("~>"), ("~> ", ""));
-        assert_eq!(parse_op("~>1."), ("~> ", "1."));
-    }
-
-    #[test]
-    fn test_op_gte_with_space() {
-        assert_eq!(parse_op(">= "), (">= ", ""));
-        assert_eq!(parse_op(">= 1.7"), (">= ", "1.7"));
-        assert_eq!(parse_op(">= 1.7.14"), (">= ", "1.7.14"));
-    }
-
-    #[test]
-    fn test_op_gte_without_space() {
-        assert_eq!(parse_op(">="), (">= ", ""));
-    }
-
-    #[test]
-    fn test_op_bare_gt() {
-        assert_eq!(parse_op(">"), (">= ", ""));
-    }
-
-    #[test]
-    fn test_op_none() {
-        // Only a truly empty partial has no operator context.
-        assert_eq!(parse_op(""), ("", ""));
-    }
-
-    #[test]
-    fn test_op_digit() {
-        assert_eq!(parse_op("0"), ("digit", "0"));
-        assert_eq!(parse_op("0."), ("digit", "0."));
-        assert_eq!(parse_op("1.7"), ("digit", "1.7"));
-        assert_eq!(parse_op("1.7.1"), ("digit", "1.7.1"));
+    fn test_label_prefix_filter_exact() {
+        let ver = "1.7.0";
+        assert!(ver.starts_with(""));
+        assert!(ver.starts_with("1."));
+        assert!(ver.starts_with("1.7"));
+        assert!(!ver.starts_with("~> "));
+        assert!(!ver.starts_with(">= "));
     }
 }
