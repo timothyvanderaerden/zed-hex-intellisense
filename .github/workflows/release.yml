@@ -1,0 +1,109 @@
+name: Release
+
+# Triggered by a tag push that matches a bare semantic-version string,
+# e.g. `git tag 0.4.0 && git push --tags`.
+# The tag name becomes the GitHub Release version, which the WASM extension
+# reads at runtime via `latest_github_release` to pick the right binary.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build one binary per target ───────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # AArch64 Linux cross-compilation requires a GCC cross-linker.
+      - name: Install AArch64 cross-linker (Linux only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build hex-ls
+        run: cargo build -p hex-ls --target ${{ matrix.target }} --release
+        env:
+          # Only used when target == aarch64-unknown-linux-gnu; harmless otherwise.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      # ── Package ──────────────────────────────────────────────────────────
+
+      # Unix: create a tar.gz containing  <asset_stem>/<binary>
+      # so that Zed's GzipTar extraction produces the expected path:
+      #   hex-ls-<version>/<asset_stem>/hex-ls
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          asset_stem="hex-ls-${{ matrix.target }}"
+          mkdir -p "${asset_stem}"
+          cp "target/${{ matrix.target }}/release/hex-ls" "${asset_stem}/"
+          tar czf "${asset_stem}.tar.gz" "${asset_stem}"
+
+      # Windows: create a zip containing hex-ls.exe at the root
+      # so that Zed's Zip extraction produces:
+      #   hex-ls-<version>/hex-ls.exe
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/hex-ls.exe" "hex-ls.exe"
+          7z a "hex-ls-${{ matrix.target }}.zip" "hex-ls.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            hex-ls-*.tar.gz
+            hex-ls-*.zip
+
+  # ── Gather artifacts and publish a GitHub Release ─────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

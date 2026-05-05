@@ -28,33 +28,32 @@ end
 
 ## Installation
 
-### Prerequisites
+### 1. Install the Zed extension
 
-Zed compiles extensions to WebAssembly and requires [`rustup`](https://rustup.rs)
-to manage the `wasm32-wasip2` target. Make sure it is installed and the target
-is available before installing the extension.
+Install **Hex.pm IntelliSense** from the Zed Extensions panel (`zed: extensions`).
 
-### 1. Install the `hex-ls` language server
+For local development, open the Extensions panel, click **Install Dev Extension**,
+and point it at the root of this repository.
 
-The extension delegates all completion logic to the `hex-ls` binary, which must
-be available in your `PATH`. From the root of this repository:
+> **No Rust toolchain required for end users.**  The extension automatically
+> downloads the correct prebuilt `hex-ls` binary for your platform from the
+> [GitHub Releases](https://github.com/timothyvanderaerden/zed-hex-intellisense/releases)
+> page on first use and caches it in Zed's extension working directory.
+> Subsequent launches reuse the cached binary; a new download only happens
+> when a newer release is available.
+
+#### Using a self-built binary instead
+
+If you prefer to run your own build of `hex-ls` — or if you develop the
+language server locally — place the binary anywhere on your `PATH` and the
+extension will use it automatically (PATH lookup always takes priority over the
+downloaded binary):
 
 ```sh
 cargo install --path hex-ls
 ```
 
-Verify it works:
-
-```sh
-hex-ls --version
-```
-
-### 2. Install the Zed extension
-
-In Zed, open the Extensions panel (`zed: extensions`), click
-**Install Dev Extension**, and point it at the root of this repository.
-
-### 3. Enable `hex-ls` for Elixir in Zed settings
+### 2. Enable `hex-ls` for Elixir in Zed settings
 
 Zed only starts the language servers explicitly listed for a language. Add
 `hex-ls` to the Elixir entry in `~/.config/zed/settings.json`:
@@ -102,21 +101,34 @@ hex-intellisense/
 
 ## Development
 
-Run the unit tests for the language server:
+Run the unit tests for the language server and the WASM extension:
 
 ```sh
-cargo test -p hex-ls
+cargo test -p hex-ls          # language server logic
+cargo test -p hex-intellisense # asset-path construction tests
 ```
 
-After modifying `hex-ls/src/main.rs`, reinstall the binary and restart Zed
-(or reload the window):
+During local development of `hex-ls`, build and install the binary to avoid
+waiting for a GitHub Release download:
 
 ```sh
 cargo install --path hex-ls
 ```
 
+The extension detects the `hex-ls` binary on `PATH` and skips the download
+entirely — the same fast-path used by regular users who install from a release.
+
 After modifying `src/lib.rs`, Zed will recompile the WASM extension
 automatically when you reinstall the dev extension.
+
+### Cutting a release
+
+1. Bump the version in `Cargo.toml` (root), `hex-ls/Cargo.toml`, `extension.toml`,
+   and the `USER_AGENT` constant in `hex-ls/src/main.rs`.
+2. Update `CHANGELOG.md`.
+3. Push a bare semver tag (no `v` prefix): `git tag 0.4.0 && git push --tags`.
+4. The [Release workflow](.github/workflows/release.yml) builds `hex-ls` for
+   all platforms and uploads the archives to a GitHub Release automatically.
 
 ## License
 

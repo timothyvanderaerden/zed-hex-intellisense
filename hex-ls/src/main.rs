@@ -19,7 +19,7 @@ use serde_json::Value;
 
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 const HEX_API_BASE: &str = "https://hex.pm/api";
-const USER_AGENT: &str = "hex-ls/0.4.0";
+const USER_AGENT: &str = "hex-ls/0.5.0";
 
 // ---------------------------------------------------------------------------
 // Lazy-compiled regexes

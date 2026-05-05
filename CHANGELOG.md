@@ -5,7 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - Unreleased
+## [0.5.0] - Unreleased
+
+## [0.4.0] - 2026-05-05
+
+### Added
+- **Auto-download of `hex-ls`**: the Zed extension now downloads the correct
+  prebuilt `hex-ls` binary for the current platform directly from GitHub
+  Releases.  No Rust toolchain is required on end-user machines.  A binary
+  already on `PATH` is always preferred over the downloaded one.
+- **GitHub Actions workflows**:
+  - `ci.yml` — runs `cargo test -p hex-ls` and checks the WASM build on every
+    push/PR to `main`.
+  - `release.yml` — triggered by a bare semver tag push (e.g. `0.4.0`); builds
+    `hex-ls` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+    `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`;
+    packages the results as `.tar.gz` / `.zip` archives; and publishes a GitHub
+    Release with all assets attached.
+- Asset-path construction tests in `src/lib.rs` covering all five target
+  triples and the `v`-prefix stripping logic.
 
 ### Changed
 - Simplified version completion filtering: removed the operator-detection
