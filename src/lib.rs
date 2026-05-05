@@ -101,16 +101,20 @@ impl HexIntelliSenseExtension {
     ) -> zed::Result<String> {
         // 1. A user-installed binary on PATH always takes priority.
         if let Some(path) = worktree.which("hex-ls") {
+            eprintln!("[hex-intellisense] found hex-ls on PATH: {path}");
             return Ok(path);
         }
+        eprintln!("[hex-intellisense] hex-ls not found on PATH");
 
         // 2. Reuse the path from a previous download within this Zed session.
         //    `fs::metadata` verifies the file still exists (e.g. not deleted
         //    by the user between LS restarts).
         if let Some(path) = &self.cached_binary_path {
             if fs::metadata(path).map_or(false, |m| m.is_file()) {
+                eprintln!("[hex-intellisense] reusing cached binary: {path}");
                 return Ok(path.clone());
             }
+            eprintln!("[hex-intellisense] cached path no longer exists: {path}");
         }
 
         // 3. Fetch the GitHub Release that matches this exact extension version.
@@ -120,46 +124,78 @@ impl HexIntelliSenseExtension {
         let version = env!("CARGO_PKG_VERSION"); // e.g. "0.5.0", set at compile time
         let tag = format!("v{version}");
 
+        eprintln!("[hex-intellisense] checking GitHub for release {tag}");
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        let release = zed::github_release_by_tag_name(REPO, &tag)
-            .map_err(|e| format!("No hex-ls release found for {tag}: {e}"))?;
+        let release = zed::github_release_by_tag_name(REPO, &tag).map_err(|e| {
+            let msg = format!("No hex-ls release found for {tag}: {e}");
+            eprintln!("[hex-intellisense] ERROR: {msg}");
+            msg
+        })?;
+
+        eprintln!("[hex-intellisense] found release: {}", release.version);
 
         let (platform, arch) = zed::current_platform();
         let details = ReleaseDetails::new(platform, arch, version);
+
+        eprintln!(
+            "[hex-intellisense] resolved asset: {} → {}",
+            details.asset_name, details.binary_path
+        );
 
         let asset = release
             .assets
             .iter()
             .find(|a| a.name == details.asset_name)
             .ok_or_else(|| {
-                format!(
+                let msg = format!(
                     "hex-ls release {version} has no asset named {:?}. \
                      Until prebuilt binaries are available you can build from source: \
                      cargo install --git https://github.com/{REPO} hex-ls",
                     details.asset_name,
-                )
+                );
+                eprintln!("[hex-intellisense] ERROR: {msg}");
+                msg
             })?;
+
+        eprintln!(
+            "[hex-intellisense] asset download URL: {}",
+            asset.download_url
+        );
 
         // Only download if the binary isn't already on disk from a previous
         // Zed session (the versioned directory acts as a cache key).
         if !fs::metadata(&details.binary_path).map_or(false, |m| m.is_file()) {
+            eprintln!("[hex-intellisense] binary not cached on disk — downloading");
             zed::set_language_server_installation_status(
                 language_server_id,
                 &zed::LanguageServerInstallationStatus::Downloading,
             );
 
             zed::download_file(&asset.download_url, &details.extract_dir, details.file_type)
-                .map_err(|e| format!("Failed to download hex-ls: {e}"))?;
+                .map_err(|e| {
+                    let msg = format!("Failed to download hex-ls: {e}");
+                    eprintln!("[hex-intellisense] ERROR: {msg}");
+                    msg
+                })?;
+
+            eprintln!(
+                "[hex-intellisense] download complete, binary at: {}",
+                details.binary_path
+            );
 
             // Unix archives don't preserve the execute bit through WASI —
             // mark the binary executable so the OS can run it.
             if matches!(platform, Os::Mac | Os::Linux) {
-                zed::make_file_executable(&details.binary_path)
-                    .map_err(|e| format!("Failed to make hex-ls executable: {e}"))?;
+                zed::make_file_executable(&details.binary_path).map_err(|e| {
+                    let msg = format!("Failed to make hex-ls executable: {e}");
+                    eprintln!("[hex-intellisense] ERROR: {msg}");
+                    msg
+                })?;
+                eprintln!("[hex-intellisense] marked binary as executable");
             }
 
             // Remove any directories left over from older versions so the
@@ -169,12 +205,20 @@ impl HexIntelliSenseExtension {
             for entry in entries {
                 let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
                 if entry.file_name().to_str() != Some(&details.extract_dir) {
-                    fs::remove_dir_all(entry.path()).ok();
+                    let old = entry.path();
+                    eprintln!(
+                        "[hex-intellisense] removing stale directory: {}",
+                        old.display()
+                    );
+                    fs::remove_dir_all(&old).ok();
                 }
             }
+        } else {
+            eprintln!("[hex-intellisense] binary already on disk — skipping download");
         }
 
         self.cached_binary_path = Some(details.binary_path.clone());
+        eprintln!("[hex-intellisense] using binary: {}", details.binary_path);
         Ok(details.binary_path)
     }
 }
