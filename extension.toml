@@ -1,6 +1,6 @@
 id = "hex-intellisense"
 name = "Hex.pm IntelliSense"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
 authors = ["Timothy Vanderaerden <timothyvanderaerden@gmail.com>"]
 description = "IntelliSense for hex.pm dependencies in Elixir mix.exs files. Provides package name and version autocompletion powered by the hex.pm API."
