@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ use serde_json::Value;
 
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 const HEX_API_BASE: &str = "https://hex.pm/api";
-const USER_AGENT: &str = "hex-ls/0.5.0";
+const USER_AGENT: &str = concat!("hex-ls/", env!("CARGO_PKG_VERSION"));
 
 // ---------------------------------------------------------------------------
 // Lazy-compiled regexes
@@ -131,7 +131,7 @@ impl ServerState {
     /// hover requests are served instantly from cache.
     fn prefetch_packages(&self, text: &str) {
         let re = hover_pkg_re();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let packages: Vec<String> = re
             .captures_iter(text)
             .filter_map(|cap| cap.get(1))
@@ -180,8 +180,7 @@ impl ServerState {
 
 fn main() {
     // Handle --version / --help flags before starting the LSP server.
-    let args: Vec<String> = std::env::args().collect();
-    for arg in &args[1..] {
+    for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-V" => {
                 println!("hex-ls {}", env!("CARGO_PKG_VERSION"));
@@ -237,7 +236,7 @@ fn main() {
         "capabilities": server_capabilities,
         "serverInfo": {
             "name": "hex-ls",
-            "version": "0.2.0"
+            "version": env!("CARGO_PKG_VERSION")
         }
     });
     connection.initialize_finish(init_id, init_result).unwrap();
@@ -369,7 +368,7 @@ fn handle_notification(state: &mut ServerState, notif: Notification) {
                 let uri = params.text_document.uri.to_string();
                 // With FULL sync, there is exactly one change event containing
                 // the complete new document text.
-                if let Some(change) = params.content_changes.into_iter().last() {
+                if let Some(change) = params.content_changes.into_iter().next() {
                     state.documents.insert(uri, change.text);
                 }
             }
@@ -397,8 +396,14 @@ enum CompletionContext {
     PackageName(String),
 
     /// Cursor is inside the version string of a dep tuple.
-    /// Contains (package_name, partial_version_text).
-    Version(String, String),
+    /// Fields: package name, partial version text, and the column (u32)
+    /// of the first character of that partial text.
+    Version {
+        pkg: String,
+        partial: String,
+        /// UTF-16 column of the first character after the opening `"`.
+        ver_start: u32,
+    },
 }
 
 /// Inspect the text on the current line up to the cursor position and
@@ -407,15 +412,19 @@ fn detect_context(text_before: &str) -> Option<CompletionContext> {
     // Check version context first – it is more specific.
     // Pattern: {:pkg_name, "partial  (no closing quote yet)
     if let Some(caps) = version_re().captures(text_before) {
-        let pkg = caps.get(1).unwrap().as_str().to_string();
-        let ver = caps.get(2).unwrap().as_str().to_string();
-        return Some(CompletionContext::Version(pkg, ver));
+        let pkg = caps[1].to_string();
+        let partial = caps[2].to_string();
+        let ver_start = caps.get(2).unwrap().start() as u32;
+        return Some(CompletionContext::Version {
+            pkg,
+            partial,
+            ver_start,
+        });
     }
 
     // Package name context: {: optionally followed by [a-z_]* at end
     if let Some(caps) = pkg_re().captures(text_before) {
-        let partial = caps.get(1).unwrap().as_str().to_string();
-        return Some(CompletionContext::PackageName(partial));
+        return Some(CompletionContext::PackageName(caps[1].to_string()));
     }
 
     None
@@ -425,6 +434,16 @@ fn detect_context(text_before: &str) -> Option<CompletionContext> {
 // Completion computation
 // ---------------------------------------------------------------------------
 
+/// Clamp `idx` to a valid UTF-8 char boundary in `s` at or before `idx`.
+/// Returns `0` if no boundary is found below `idx`.
+fn safe_char_boundary(s: &str, idx: usize) -> usize {
+    let clamped = idx.min(s.len());
+    (0..=clamped)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0)
+}
+
 fn compute_completions(state: &mut ServerState, params: &CompletionParams) -> Vec<CompletionItem> {
     let uri = params.text_document_position.text_document.uri.to_string();
 
@@ -433,10 +452,8 @@ fn compute_completions(state: &mut ServerState, params: &CompletionParams) -> Ve
         return vec![];
     }
 
-    // Retrieve the stored document text.
-    let content = match state.documents.get(&uri) {
-        Some(c) => c.clone(),
-        None => return vec![],
+    let Some(content) = state.documents.get(&uri).cloned() else {
+        return vec![];
     };
 
     let line_idx = params.text_document_position.position.line as usize;
@@ -444,42 +461,29 @@ fn compute_completions(state: &mut ServerState, params: &CompletionParams) -> Ve
 
     // Split into lines, taking care of \r\n line endings.
     let lines: Vec<&str> = content.lines().collect();
-    let current_line = match lines.get(line_idx) {
-        Some(l) => l.trim_end_matches('\r'),
-        None => return vec![],
+    let Some(current_line) = lines.get(line_idx).map(|l| l.trim_end_matches('\r')) else {
+        return vec![];
     };
 
-    // Slice the line up to the cursor.  char_idx is a UTF-16 column number,
-    // but mix.exs content is effectively ASCII, so we treat it as a byte
-    // offset with a safe bounds check.
-    let safe_end = char_idx.min(current_line.len());
-    // Walk back to the nearest valid UTF-8 char boundary (handles edge cases).
-    let safe_end = (0..=safe_end)
-        .rev()
-        .find(|&i| current_line.is_char_boundary(i))
-        .unwrap_or(0);
+    // char_idx is a UTF-16 column; mix.exs is effectively ASCII so we treat it
+    // as a byte offset with a safe boundary clamp.
+    let safe_end = safe_char_boundary(current_line, char_idx);
     let text_before = &current_line[..safe_end];
 
     match detect_context(text_before) {
         Some(CompletionContext::PackageName(partial)) => complete_package_names(state, &partial),
-        Some(CompletionContext::Version(pkg, partial_ver)) => {
-            // Find where the partial version text starts in the line so we can
-            // build a text_edit that replaces the whole partial (not just the
-            // current word-boundary token that Zed would otherwise guess).
-            let ver_start = version_re()
-                .captures(text_before)
-                .and_then(|c| c.get(2))
-                .map(|m| m.start() as u32)
-                .unwrap_or(safe_end as u32);
-            complete_versions(
-                state,
-                &pkg,
-                &partial_ver,
-                line_idx as u32,
-                ver_start,
-                safe_end as u32,
-            )
-        }
+        Some(CompletionContext::Version {
+            pkg,
+            partial,
+            ver_start,
+        }) => complete_versions(
+            state,
+            &pkg,
+            &partial,
+            line_idx as u32,
+            ver_start,
+            safe_end as u32,
+        ),
         None => vec![],
     }
 }
@@ -496,14 +500,11 @@ fn complete_package_names(state: &mut ServerState, partial: &str) -> Vec<Complet
         format!("{HEX_API_BASE}/packages?search={partial}&sort=downloads&page=1")
     };
 
-    let data = match state.fetch_json(&url) {
-        Some(d) => d,
-        None => return vec![],
+    let Some(data) = state.fetch_json(&url) else {
+        return vec![];
     };
-
-    let packages = match data.as_array() {
-        Some(a) => a.clone(),
-        None => return vec![],
+    let Some(packages) = data.as_array() else {
+        return vec![];
     };
 
     packages
@@ -549,32 +550,27 @@ fn complete_versions(
 ) -> Vec<CompletionItem> {
     let url = format!("{HEX_API_BASE}/packages/{pkg_name}");
 
-    let data = match state.fetch_json(&url) {
-        Some(d) => d,
-        None => return vec![],
+    let Some(data) = state.fetch_json(&url) else {
+        return vec![];
     };
-
-    let releases = match data["releases"].as_array() {
-        Some(r) => r.clone(),
-        None => return vec![],
+    let Some(releases) = data["releases"].as_array() else {
+        return vec![];
     };
 
     // Collect version strings.  The API returns them newest-first already.
-    let versions: Vec<String> = releases
+    let versions: Vec<&str> = releases
         .iter()
-        .filter_map(|r| r["version"].as_str().map(|s| s.to_string()))
+        .filter_map(|r| r["version"].as_str())
         .take(20)
         .collect();
 
     // -----------------------------------------------------------------------
     // Deduplication for ~> X.Y suggestions
     // -----------------------------------------------------------------------
-    let mut latest_patch_for_minor: HashMap<String, String> = HashMap::new();
-    for ver in &versions {
+    let mut latest_patch_for_minor: HashMap<String, &str> = HashMap::new();
+    for &ver in &versions {
         if let Some(mk) = minor_key(ver) {
-            latest_patch_for_minor
-                .entry(mk)
-                .or_insert_with(|| ver.clone());
+            latest_patch_for_minor.entry(mk).or_insert(ver);
         }
     }
 
@@ -605,22 +601,19 @@ fn complete_versions(
     };
 
     let mut items: Vec<CompletionItem> = Vec::new();
-    let mut tilde_emitted: HashMap<String, ()> = HashMap::new();
-    let mut first_item = true; // used to preselect the top suggestion
+    let mut tilde_emitted: HashSet<String> = HashSet::new();
 
-    for ver in &versions {
+    for &ver in &versions {
         // ── ~> X.Y ──────────────────────────────────────────────────────
         if let Some(mk) = minor_key(ver) {
-            let is_latest = latest_patch_for_minor.get(&mk).map(|s| s.as_str()) == Some(ver);
-            if is_latest && !tilde_emitted.contains_key(&mk) {
-                tilde_emitted.insert(mk.clone(), ());
+            let is_latest = latest_patch_for_minor.get(&mk).is_some_and(|&lv| lv == ver);
+            if is_latest && tilde_emitted.insert(mk.clone()) {
                 let label = format!("~> {mk}");
                 // Server-side pre-filter: only send items whose label is
                 // prefixed by what the user has typed.  Zed will also filter
                 // client-side, but this keeps the response small.
                 if label.starts_with(partial) {
-                    let preselect = first_item;
-                    first_item = false;
+                    let preselect = items.is_empty();
                     items.push(CompletionItem {
                         label: label.clone(),
                         kind: Some(CompletionItemKind::VALUE),
@@ -638,8 +631,7 @@ fn complete_versions(
         {
             let label = format!(">= {ver}");
             if label.starts_with(partial) {
-                let preselect = first_item;
-                first_item = false;
+                let preselect = items.is_empty();
                 items.push(CompletionItem {
                     label: label.clone(),
                     kind: Some(CompletionItemKind::VALUE),
@@ -654,10 +646,9 @@ fn complete_versions(
 
         // ── Exact version ───────────────────────────────────────────────
         if ver.starts_with(partial) {
-            let preselect = first_item;
-            first_item = false;
+            let preselect = items.is_empty();
             items.push(CompletionItem {
-                label: ver.clone(),
+                label: ver.to_string(),
                 kind: Some(CompletionItemKind::VALUE),
                 // Generate the dep snippet for *this specific* version.
                 // The API's `configs["mix.exs"]` always uses the latest
@@ -696,35 +687,23 @@ fn minor_key(version: &str) -> Option<String> {
 /// tuple like `{:phoenix, "~> 1.7"}`.  Uses a non-`?` guard so that a
 /// missing capture group skips the match rather than short-circuiting.
 fn package_name_at_cursor(line: &str, char_idx: usize) -> Option<String> {
-    let re = hover_pkg_re();
-    for caps in re.captures_iter(line) {
-        if let Some(m) = caps.get(1) {
-            // m.end() is exclusive, so use < (not <=) to avoid matching
-            // the character immediately after the package name.
-            if char_idx >= m.start() && char_idx < m.end() {
-                return Some(m.as_str().to_string());
-            }
-        }
-    }
-    None
+    hover_pkg_re().captures_iter(line).find_map(|caps| {
+        caps.get(1)
+            .filter(|m| char_idx >= m.start() && char_idx < m.end())
+            .map(|m| m.as_str().to_string())
+    })
 }
 
 /// Return the package name if the cursor sits inside the quoted version string
 /// of a dep tuple, e.g. `{:phoenix, "~> 1.7"}`.  Returns `None` otherwise.
 fn version_pkg_at_cursor(line: &str, char_idx: usize) -> Option<String> {
-    let re = version_hover_re();
-    for caps in re.captures_iter(line) {
-        if let (Some(pkg_m), Some(ver_m)) = (caps.get(1), caps.get(2)) {
-            // The opening quote is the byte immediately before the captured
-            // content; the closing quote sits at ver_m.end().
-            let quote_open = ver_m.start().saturating_sub(1);
-            let quote_close = ver_m.end(); // inclusive (closing `"`)
-            if char_idx >= quote_open && char_idx <= quote_close {
-                return Some(pkg_m.as_str().to_string());
-            }
-        }
-    }
-    None
+    version_hover_re().captures_iter(line).find_map(|caps| {
+        let pkg_m = caps.get(1)?;
+        let ver_m = caps.get(2)?;
+        let quote_open = ver_m.start().saturating_sub(1);
+        let quote_close = ver_m.end();
+        (char_idx >= quote_open && char_idx <= quote_close).then(|| pkg_m.as_str().to_string())
+    })
 }
 
 fn compute_hover(state: &mut ServerState, params: &HoverParams) -> Option<Hover> {
@@ -739,8 +718,7 @@ fn compute_hover(state: &mut ServerState, params: &HoverParams) -> Option<Hover>
         return None;
     }
 
-    // Retrieve the stored document text.
-    let content = state.documents.get(&uri)?.clone();
+    let content = state.documents.get(&uri)?.to_owned();
 
     let line_idx = params.text_document_position_params.position.line as usize;
     let char_idx = params.text_document_position_params.position.character as usize;
@@ -750,11 +728,7 @@ fn compute_hover(state: &mut ServerState, params: &HoverParams) -> Option<Hover>
     let current_line = lines.get(line_idx)?.trim_end_matches('\r');
 
     // Safe byte-offset (same logic as compute_completions).
-    let safe_idx = char_idx.min(current_line.len());
-    let safe_idx = (0..=safe_idx)
-        .rev()
-        .find(|&i| current_line.is_char_boundary(i))
-        .unwrap_or(0);
+    let safe_idx = safe_char_boundary(current_line, char_idx);
 
     // Hover over the package name → show package info.
     if let Some(pkg_name) = package_name_at_cursor(current_line, safe_idx) {
@@ -837,7 +811,7 @@ fn hover_version_list(state: &mut ServerState, pkg_name: &str) -> Option<Hover> 
     let url = format!("{HEX_API_BASE}/packages/{pkg_name}");
     let data = state.fetch_json(&url)?;
 
-    let releases = data["releases"].as_array()?.clone();
+    let releases = data["releases"].as_array()?;
 
     // Group versions by their X.Y minor key, preserving newest-first order.
     let mut minors: Vec<String> = Vec::new();
@@ -859,9 +833,8 @@ fn hover_version_list(state: &mut ServerState, pkg_name: &str) -> Option<Hover> 
     }
 
     let mut md = format!("### {} — available versions\n\n", pkg_name);
-    let display_minors = minors.iter().take(8).collect::<Vec<_>>();
-    for mk in &display_minors {
-        let versions = &by_minor[*mk];
+    for mk in minors.iter().take(8) {
+        let versions = &by_minor[mk];
         let shown: Vec<&str> = versions.iter().take(5).map(String::as_str).collect();
         let ellipsis = if versions.len() > 5 { " …" } else { "" };
         md.push_str(&format!(
@@ -926,9 +899,9 @@ mod tests {
     fn test_detect_context_version() {
         let ctx = detect_context(r#"    {:phoenix, "~> "#).unwrap();
         match ctx {
-            CompletionContext::Version(pkg, ver) => {
+            CompletionContext::Version { pkg, partial, .. } => {
                 assert_eq!(pkg, "phoenix");
-                assert_eq!(ver, "~> ");
+                assert_eq!(partial, "~> ");
             }
             _ => panic!("expected Version"),
         }
@@ -938,9 +911,9 @@ mod tests {
     fn test_detect_context_version_empty_prefix() {
         let ctx = detect_context(r#"    {:ecto_sql, ""#).unwrap();
         match ctx {
-            CompletionContext::Version(pkg, ver) => {
+            CompletionContext::Version { pkg, partial, .. } => {
                 assert_eq!(pkg, "ecto_sql");
-                assert_eq!(ver, "");
+                assert_eq!(partial, "");
             }
             _ => panic!("expected Version"),
         }

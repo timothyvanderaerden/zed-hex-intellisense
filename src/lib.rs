@@ -110,7 +110,7 @@ impl HexIntelliSenseExtension {
         //    `fs::metadata` verifies the file still exists (e.g. not deleted
         //    by the user between LS restarts).
         if let Some(path) = &self.cached_binary_path {
-            if fs::metadata(path).map_or(false, |m| m.is_file()) {
+            if fs::metadata(path).is_ok_and(|m| m.is_file()) {
                 eprintln!("[hex-intellisense] reusing cached binary: {path}");
                 return Ok(path.clone());
             }
@@ -168,7 +168,7 @@ impl HexIntelliSenseExtension {
 
         // Only download if the binary isn't already on disk from a previous
         // Zed session (the versioned directory acts as a cache key).
-        if !fs::metadata(&details.binary_path).map_or(false, |m| m.is_file()) {
+        if !fs::metadata(&details.binary_path).is_ok_and(|m| m.is_file()) {
             eprintln!("[hex-intellisense] binary not cached on disk — downloading");
             zed::set_language_server_installation_status(
                 language_server_id,
